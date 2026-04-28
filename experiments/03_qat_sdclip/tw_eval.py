@@ -68,10 +68,6 @@ class Hyperparameters:
     ttt_epochs = int(os.environ.get('TTT_EPOCHS', 3))
     ttt_momentum = float(os.environ.get('TTT_MOMENTUM', 0.9))
     ttt_chunk_tokens = int(os.environ.get('TTT_CHUNK_TOKENS', 32768))
-    # [04] doc-boundary chunking for TTT
-    ttt_doc_boundary_enabled = bool(int(os.environ.get('TTT_DOC_BOUNDARY_ENABLED', '0')))
-    ttt_doc_sep_token = int(os.environ.get('TTT_DOC_SEP_TOKEN', '-1'))  # -1 -> resolve to sp.bos_id() at runtime
-    ttt_min_chunk_tokens = int(os.environ.get('TTT_MIN_CHUNK_TOKENS', 16384))
     etlb_enabled = bool(int(os.environ.get('ETLB_ENABLED', '0')))
     etlb_lr = float(os.environ.get('ETLB_LR', 0.05))
     etlb_steps = int(os.environ.get('ETLB_STEPS', 5))
@@ -83,6 +79,12 @@ class Hyperparameters:
     embed_bits = int(os.environ.get('EMBED_BITS', 8))
     matrix_clip_sigmas = float(os.environ.get('MATRIX_CLIP_SIGMAS', 12.85))
     embed_clip_sigmas = float(os.environ.get('EMBED_CLIP_SIGMAS', 20.0))
+    qat_enabled = bool(int(os.environ.get('QAT_ENABLED', '0')))
+    qat_start_frac = float(os.environ.get('QAT_START_FRAC', 0.85))
+    qat_ramp_frac = float(os.environ.get('QAT_RAMP_FRAC', 0.05))
+    qat_bits = int(os.environ.get('QAT_BITS', 6))
+    qat_k_sigmas = float(os.environ.get('QAT_K_SIGMAS', 12.85))
+    qat_apply_to_embed = bool(int(os.environ.get('QAT_APPLY_TO_EMBED', '0')))
     distributed = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
     rank = int(os.environ.get('RANK', '0'))
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
@@ -248,10 +250,73 @@ class RMSNorm(nn.Module):
     def forward(self, x):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
+class _SDClipFakeQuantizeSTE(torch.autograd.Function):
+    """Per-row SDClip fake-quantize with straight-through estimator.
+
+    Forward: clip + round + dequant against per-row sigma scale.
+    Backward: identity (gradient flows through unchanged).
+    Per-row sigma is recomputed from the *current* W each call, so it tracks
+    what GPTQ would see at calibration time.
+    """
+
+    @staticmethod
+    def forward(ctx, W, k_sigmas, clip_range):
+        row_std = W.float().std(dim=1, keepdim=True)
+        c = k_sigmas * row_std
+        s = (c / clip_range).clamp_min(1e-10)
+        q = torch.clamp(torch.round(W.float() / s), -clip_range, clip_range)
+        return (q * s).to(W.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Straight-through estimator: pass gradient unchanged for W.
+        # No grad for the python-scalar k_sigmas / clip_range arguments.
+        return (grad_output, None, None)
+
+
+def _sdclip_fake_quantize(W, k_sigmas, clip_range):
+    """Apply per-row SDClip fake-quantize with STE backward.
+
+    forward: clip + round + dequant; backward: identity (STE).
+    Per-row: c = k_sigmas * W.std(dim=1, keepdim=True)
+    s = c / clip_range
+    q = clamp(round(W / s), -clip_range, clip_range)
+    return q * s
+    """
+    return _SDClipFakeQuantizeSTE.apply(W, float(k_sigmas), int(clip_range))
+
+
+def _qat_blend_weight(weight, qat_strength, k_sigmas, clip_range):
+    """Linear blend between W and fake_quantize(W) controlled by qat_strength.
+
+    qat_strength is a scalar tensor in [0, 1]:
+      - 0 => returns weight unchanged (numerically equivalent to non-QAT path)
+      - 1 => returns the fully fake-quantized weight
+    The graph is always-on; the blend coefficient is *data*, not structure, so
+    torch.compile does not need to recompile when alpha changes step-to-step.
+    """
+    fq = _sdclip_fake_quantize(weight, k_sigmas, clip_range)
+    alpha = qat_strength.to(weight.dtype)
+    return weight + alpha * (fq - weight)
+
+
 class CastedLinear(nn.Linear):
+    # QAT plumbing. Defaults keep behavior byte-identical to SOTA when QAT is
+    # disabled: _qat_apply=False short-circuits the blend op entirely.
+    _qat_strength = None  # shared scalar buffer set by GPT.__init__
+    _qat_k_sigmas = 12.85
+    _qat_clip_range = 31
+    _qat_apply = False  # toggled per-module by GPT (matrix linears only)
 
     def forward(self, x):
-        w = self.weight.to(x.dtype)
+        if self._qat_apply and self._qat_strength is not None:
+            # Always run the same op when active; the alpha=0 case still folds
+            # to identity numerically. This single graph branch is decided at
+            # module-construction time, so torch.compile sees a stable shape.
+            w = _qat_blend_weight(self.weight, self._qat_strength, self._qat_k_sigmas, self._qat_clip_range)
+        else:
+            w = self.weight
+        w = w.to(x.dtype)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w, bias)
 
@@ -434,7 +499,32 @@ class GPT(nn.Module):
         self.num_skip_weights = min(len(self.encoder_indices), len(self.decoder_indices))
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, h.model_dim, dtype=torch.float32))
         self.skip_gates = nn.Parameter(torch.zeros(self.num_skip_weights, h.model_dim, dtype=torch.float32)) if h.skip_gates_enabled else None
+        # QAT state. The qat_strength buffer is a single scalar shared across
+        # all CastedLinear modules. alpha=0 makes the fake-quant blend a no-op
+        # (byte-identical to SOTA). alpha=1 means forward sees the fully
+        # fake-quantized weight. Buffer travels with the model under .to().
+        self.register_buffer('qat_strength', torch.zeros((), dtype=torch.float32), persistent=False)
+        self._qat_enabled = bool(h.qat_enabled)
+        self._qat_k_sigmas = float(h.qat_k_sigmas)
+        self._qat_clip_range = int(2 ** (int(h.qat_bits) - 1) - 1)
+        self._qat_apply_to_embed = bool(h.qat_apply_to_embed)
+        # Wire CastedLinear modules: matrix-class linears (mlp/attn) get
+        # _qat_apply=True; embed/head linears only when explicitly opted in.
+        for name, module in self.named_modules():
+            if isinstance(module, CastedLinear):
+                module._qat_strength = self.qat_strength
+                module._qat_k_sigmas = self._qat_k_sigmas
+                module._qat_clip_range = self._qat_clip_range
+                cat = classify_param(name + '.weight')
+                is_matrix = cat in ('mlp', 'attn')
+                is_embed_like = cat == 'embed'
+                module._qat_apply = bool(self._qat_enabled) and (is_matrix or (is_embed_like and self._qat_apply_to_embed))
         self._init_weights()
+
+    def set_qat_strength(self, alpha):
+        """Set the shared QAT blend strength in [0, 1]. 0 disables, 1 fully on."""
+        with torch.no_grad():
+            self.qat_strength.fill_(float(alpha))
 
     def _init_weights(self):
         if self.tie_embeddings:
@@ -808,6 +898,13 @@ def serialize(h, base_model, code):
 def deserialize(h, device):
     eval_model = GPT(h).to(device).bfloat16()
     restore_fp32_params(eval_model)
+    # Force QAT off on the eval-time model: deserialized weights are *already*
+    # the post-GPTQ dequantized state, so any further fake-quantize would
+    # double-quantize and corrupt the eval. Keep _qat_apply False everywhere.
+    for module in eval_model.modules():
+        if isinstance(module, CastedLinear):
+            module._qat_apply = False
+    eval_model.set_qat_strength(0.0)
     sd_cpu = {k: v.detach().cpu() for k, v in eval_model.state_dict().items()}
     with open(h.quantized_model_path, 'rb') as f:
         quant_blob_disk = f.read()
@@ -908,35 +1005,6 @@ def eval_val_sliding(h, device, val_data, base_model, batch_seqs=32):
     base_model.train()
     return _loss_bpb(loss_sum, token_count, byte_count)
 
-# [04] Helpers for doc-boundary TTT chunking
-def _find_doc_boundaries(val_tokens, doc_sep_token):
-    matches = (val_tokens == int(doc_sep_token)).nonzero(as_tuple=True)[0]
-    return matches.tolist()
-
-def _chunk_at_doc_boundaries(total_tokens, doc_boundaries, target_chunk_tokens, min_chunk_tokens):
-    chunks = []
-    chunk_start = 0
-    bi = 0
-    fallback_count = 0
-    while chunk_start < total_tokens:
-        while bi < len(doc_boundaries) and doc_boundaries[bi] < chunk_start + min_chunk_tokens:
-            bi += 1
-        max_end = chunk_start + 2 * target_chunk_tokens
-        if bi < len(doc_boundaries) and doc_boundaries[bi] <= max_end:
-            chunk_end = doc_boundaries[bi]
-            bi += 1
-            used_fallback = False
-        else:
-            chunk_end = chunk_start + target_chunk_tokens
-            used_fallback = True
-        if total_tokens - chunk_end < min_chunk_tokens or chunk_end > total_tokens:
-            chunk_end = total_tokens
-        chunks.append((chunk_start, chunk_end))
-        if used_fallback:
-            fallback_count += 1
-        chunk_start = chunk_end
-    return (chunks, fallback_count)
-
 def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
     rank = h.rank
     world_size = h.world_size
@@ -946,27 +1014,13 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
     ttt_chunk = h.ttt_chunk_tokens
     context_size = seq_len - stride
     window_starts = [ws for ws in range(0, total_tokens, stride) if ws + context_size < total_tokens]
-    # [04] doc-boundary chunking
-    if h.ttt_doc_boundary_enabled:
-        sep_token = h.ttt_doc_sep_token if h.ttt_doc_sep_token >= 0 else int(val_data.sp.bos_id())
-        doc_bounds = _find_doc_boundaries(val_data.val_tokens, sep_token)
-        chunk_ranges, fallback_count = _chunk_at_doc_boundaries(total_tokens, doc_bounds, ttt_chunk, h.ttt_min_chunk_tokens)
-        num_chunks = len(chunk_ranges)
-        sizes = [e - s for s, e in chunk_ranges]
-        log(f'ttt:doc_boundary sep_token={sep_token} num_doc_bounds={len(doc_bounds)} chunks={num_chunks} fallback={fallback_count} mean_chunk={sum(sizes)//max(num_chunks,1)} min={min(sizes) if sizes else 0} max={max(sizes) if sizes else 0}')
-    else:
-        num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
-        chunk_ranges = [(ci * ttt_chunk, min((ci + 1) * ttt_chunk, total_tokens)) for ci in range(num_chunks)]
+    num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
     chunk_windows = [[] for _ in range(num_chunks)]
     for ws in window_starts:
         wlen = min(ws + seq_len, total_tokens) - ws
         s = 0 if ws == 0 else context_size
         scored_start = ws + s
-        ci = num_chunks - 1
-        for j, (cs, ce) in enumerate(chunk_ranges):
-            if scored_start < ce:
-                ci = j
-                break
+        ci = min(scored_start // ttt_chunk, num_chunks - 1)
         chunk_windows[ci].append(ws)
     log(f'ttt:start chunks={num_chunks} ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs}')
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
@@ -981,7 +1035,8 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
         windows = chunk_windows[ci]
         if not windows:
             continue
-        chunk_start, chunk_end = chunk_ranges[ci]
+        chunk_start = ci * ttt_chunk
+        chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
         my_s = len(windows) * rank // world_size
         my_e = len(windows) * (rank + 1) // world_size
         my_windows = windows[my_s:my_e]
@@ -1138,10 +1193,15 @@ def train_model(h, device, val_data):
         if h.distributed:
             model.require_backward_grad_sync = True
         train_loader = ShuffledSequenceLoader(h, device)
+    # EMA tracks the *un-quantized* training weights. The Muon/Adam optimizers
+    # update base_model.weight directly; QAT only intercepts the forward pass
+    # via a fresh fake-quantize op that does NOT mutate parameters. So EMA of
+    # state_dict() captures the exact weights GPTQ will be given at the end.
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
     ema_decay = h.ema_decay
     training_time_ms = 0.0
     stop_after_step = None
+    qat_logged = False
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -1165,6 +1225,15 @@ def train_model(h, device, val_data):
         if h.num_loops > 0 and (not base_model.looping_active) and (frac >= h.enable_looping_at):
             base_model.looping_active = True
             log(f'layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}')
+        # QAT alpha schedule: ramp 0 -> 1 over [start, start+ramp]. Updating a
+        # buffer (not graph topology) keeps torch.compile / DDP stable.
+        if h.qat_enabled:
+            ramp = max(h.qat_ramp_frac, 1e-09)
+            alpha = max(0.0, min(1.0, (frac - h.qat_start_frac) / ramp))
+            base_model.set_qat_strength(alpha)
+            if not qat_logged and alpha > 0.0:
+                log(f'qat:enabled step:{step} frac:{frac:.3f} bits:{h.qat_bits} k_sigmas:{h.qat_k_sigmas} ramp_frac:{h.qat_ramp_frac}')
+                qat_logged = True
         train_loss = step_fn(step, scale)
         with torch.no_grad():
             for name, t in base_model.state_dict().items():
@@ -1187,6 +1256,9 @@ def train_model(h, device, val_data):
     current_state = base_model.state_dict()
     avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
     base_model.load_state_dict(avg_state, strict=True)
+    # Disable QAT before downstream pre-quant eval and GPTQ Hessian collection:
+    # both should see un-quantized weights (GPTQ does its own quant internally).
+    base_model.set_qat_strength(0.0)
     return (base_model, compiled_model)
 
 def train_and_eval(h, device):
@@ -1234,8 +1306,9 @@ def main():
         raise RuntimeError('CUDA is required')
     if world_size <= 0:
         raise ValueError(f'WORLD_SIZE must be positive, got {world_size}')
-    if 8 % world_size != 0:
-        raise ValueError(f'WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral')
+    # [exp] relaxed: see 01_per_group_sdclip for rationale
+    if world_size > 8 or 786432 % (world_size * (8 // max(world_size, 1))) != 0:
+        raise ValueError(f'WORLD_SIZE={world_size} not supported: train_batch_tokens must divide cleanly')
     device = torch.device('cuda', local_rank)
     torch.cuda.set_device(device)
     if distributed:

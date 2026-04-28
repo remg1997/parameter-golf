@@ -79,18 +79,12 @@ class Hyperparameters:
     embed_bits = int(os.environ.get('EMBED_BITS', 8))
     matrix_clip_sigmas = float(os.environ.get('MATRIX_CLIP_SIGMAS', 12.85))
     embed_clip_sigmas = float(os.environ.get('EMBED_CLIP_SIGMAS', 20.0))
-    # [01] per-group SDClip allocator
-    per_group_quant_enabled = bool(int(os.environ.get('PER_GROUP_QUANT_ENABLED', '0')))
-    group_clip_sigmas_early = float(os.environ.get('GROUP_CLIP_SIGMAS_EARLY', 10.5))
-    group_clip_sigmas_loop = float(os.environ.get('GROUP_CLIP_SIGMAS_LOOP', 12.0))
-    group_clip_sigmas_mid = float(os.environ.get('GROUP_CLIP_SIGMAS_MID', 12.85))
-    group_clip_sigmas_late = float(os.environ.get('GROUP_CLIP_SIGMAS_LATE', 14.5))
-    group_clip_sigmas_embed = float(os.environ.get('GROUP_CLIP_SIGMAS_EMBED', 20.0))
-    group_bits_early = int(os.environ.get('GROUP_BITS_EARLY', 6))
-    group_bits_loop = int(os.environ.get('GROUP_BITS_LOOP', 6))
-    group_bits_mid = int(os.environ.get('GROUP_BITS_MID', 6))
-    group_bits_late = int(os.environ.get('GROUP_BITS_LATE', 6))
-    group_bits_embed = int(os.environ.get('GROUP_BITS_EMBED', 8))
+    # [02] alt compressors. COMPRESSOR='brotli' (SOTA), 'lzma', 'zstd', 'zstd_dict'.
+    byte_shuffle = bool(int(os.environ.get('BYTE_SHUFFLE', '1')))
+    zstd_level = int(os.environ.get('ZSTD_LEVEL', '22'))
+    zstd_dict_size = int(os.environ.get('ZSTD_DICT_SIZE', '8192'))
+    compress_compare = bool(int(os.environ.get('COMPRESS_COMPARE', '1')))
+    compress_roundtrip_test = bool(int(os.environ.get('COMPRESS_ROUNDTRIP_TEST', '1')))
     distributed = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
     rank = int(os.environ.get('RANK', '0'))
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
@@ -497,22 +491,6 @@ def classify_param(name):
         return 'attn'
     return 'other'
 
-# [01] per-group SDClip group assignment
-def _assign_quant_group(name, num_layers, loop_start, loop_end):
-    if 'tok_emb' in name or 'lm_head' in name or 'embed_proj' in name or 'head_proj' in name:
-        return 'embed'
-    m = re.search(r'blocks\.(\d+)\.', name)
-    if not m:
-        return 'mid'
-    layer_idx = int(m.group(1))
-    if layer_idx < loop_start:
-        return 'early'
-    if loop_start <= layer_idx <= loop_end:
-        return 'loop'
-    if layer_idx >= num_layers - 3:
-        return 'late'
-    return 'mid'
-
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps=10, eps=1e-07):
     a, b, c = (3.4445, -4.775, 2.0315)
@@ -710,41 +688,18 @@ def gptq_quantize_weight(w, H, clip_sigmas=3.0, clip_range=63, block_size=128):
 def gptq_mixed_quantize(state_dict, hessians, h):
     result = {}
     meta = {}
-    # [01] per-group dispatch tables (only consulted when h.per_group_quant_enabled)
-    group_cs = {
-        'embed': h.group_clip_sigmas_embed,
-        'early': h.group_clip_sigmas_early,
-        'loop': h.group_clip_sigmas_loop,
-        'mid': h.group_clip_sigmas_mid,
-        'late': h.group_clip_sigmas_late,
-    }
-    group_bits = {
-        'embed': h.group_bits_embed,
-        'early': h.group_bits_early,
-        'loop': h.group_bits_loop,
-        'mid': h.group_bits_mid,
-        'late': h.group_bits_late,
-    }
-    group_q_bytes = collections.defaultdict(int)
     for name, tensor in state_dict.items():
         t = tensor.detach().cpu().contiguous()
         if not t.is_floating_point() or t.numel() <= 65536:
             result[name] = t.to(torch.float16) if t.is_floating_point() else t
             meta[name] = 'passthrough (float16)'
             continue
-        if h.per_group_quant_enabled:
-            grp = _assign_quant_group(name, h.num_layers, h.loop_start, h.loop_end)
-            cs = group_cs[grp]
-            bits = group_bits[grp]
-        else:
-            grp = 'embed' if 'tok_emb' in name else 'matrix'
-            cs = h.embed_clip_sigmas if 'tok_emb' in name else h.matrix_clip_sigmas
-            bits = h.embed_bits if 'tok_emb' in name else h.matrix_bits
+        cs = h.embed_clip_sigmas if 'tok_emb' in name else h.matrix_clip_sigmas
+        bits = h.embed_bits if 'tok_emb' in name else h.matrix_bits
         q, s = gptq_quantize_weight(t, hessians[name], clip_sigmas=cs, clip_range=2 ** (bits - 1) - 1)
         result[name + '.q'] = q
         result[name + '.scale'] = s
-        meta[name] = f'gptq (int{bits}) [{grp}]' if h.per_group_quant_enabled else f'gptq (int{bits})'
-        group_q_bytes[grp] += q.numel() * bits / 8.0
+        meta[name] = f'gptq (int{bits})'
     categories = collections.defaultdict(set)
     for name, cat in meta.items():
         short = re.sub('\\.\\d+$', '', re.sub('blocks\\.\\d+', 'blocks', name))
@@ -752,10 +707,6 @@ def gptq_mixed_quantize(state_dict, hessians, h):
     log('Quantized weights:')
     for cat in sorted(categories):
         log(f"  {cat}: {', '.join(sorted(categories[cat]))}")
-    if h.per_group_quant_enabled:
-        log('Per-group raw quantized bytes (pre-compression):')
-        for grp in sorted(group_q_bytes):
-            log(f"  {grp}: cs={group_cs[grp]} bits={group_bits[grp]} raw_bytes={int(group_q_bytes[grp])}")
     return (result, meta)
 
 def dequantize_mixed(result, meta, template_sd):
@@ -808,24 +759,64 @@ def _byte_unshuffle(data):
         src_off += chunk_len
     return out.tobytes()
 
-def _compress(data, compressor):
-    data = _byte_shuffle(data)
+# [02] zstd-with-trained-dictionary as an alternative entropy coder.
+# Trains a small (default 8KB) dictionary on the data itself, ships dict+payload.
+# For Gaussian-distributed int6 weight bytes, zstd-22+dict approaches the entropy bound
+# more aggressively than Brotli's text-tuned window.
+def _zstd_compress(data, level, with_dict, dict_size):
+    import struct as _struct
+    import zstandard as _zstd
+    if with_dict:
+        sample_size = max(4096, len(data) // 256)
+        samples = [data[i:i + sample_size] for i in range(0, len(data), sample_size)]
+        if len(samples) >= 7:
+            dict_data = _zstd.train_dictionary(dict_size, samples)
+            dict_bytes = dict_data.as_bytes()
+            cctx = _zstd.ZstdCompressor(level=level, dict_data=dict_data)
+            body = cctx.compress(data)
+            return b'ZSTD' + _struct.pack('<I', len(dict_bytes)) + dict_bytes + body
+    cctx = _zstd.ZstdCompressor(level=level)
+    body = cctx.compress(data)
+    return b'ZSTD' + _struct.pack('<I', 0) + body
+
+def _zstd_decompress(data):
+    import struct as _struct
+    import zstandard as _zstd
+    assert data[:4] == b'ZSTD', f'Bad zstd magic: {data[:4]!r}'
+    dlen = _struct.unpack('<I', data[4:8])[0]
+    if dlen == 0:
+        return _zstd.ZstdDecompressor().decompress(data[8:])
+    dict_bytes = data[8:8 + dlen]
+    body = data[8 + dlen:]
+    dict_data = _zstd.ZstdCompressionDict(dict_bytes)
+    return _zstd.ZstdDecompressor(dict_data=dict_data).decompress(body)
+
+def _compress(data, compressor, byte_shuffle=True, zstd_level=22, zstd_dict_size=8192):
+    if byte_shuffle:
+        data = _byte_shuffle(data)
     if compressor == 'lzma':
         return lzma.compress(data, preset=6)
     elif compressor == 'brotli':
         import brotli
         return brotli.compress(data, quality=11)
+    elif compressor == 'zstd':
+        return _zstd_compress(data, level=zstd_level, with_dict=False, dict_size=zstd_dict_size)
+    elif compressor == 'zstd_dict':
+        return _zstd_compress(data, level=zstd_level, with_dict=True, dict_size=zstd_dict_size)
     raise ValueError(f'Unknown compressor: {compressor!r}')
 
-def _decompress(data, compressor):
+def _decompress(data, compressor, byte_shuffle=True):
     if compressor == 'lzma':
         raw = lzma.decompress(data)
     elif compressor == 'brotli':
         import brotli
         raw = brotli.decompress(data)
+    elif compressor in ('zstd', 'zstd_dict'):
+        raw = _zstd_decompress(data)
     else:
         raise ValueError(f'Unknown compressor: {compressor!r}')
-    raw = _byte_unshuffle(raw)
+    if byte_shuffle:
+        raw = _byte_unshuffle(raw)
     return raw
 
 def serialize(h, base_model, code):
@@ -846,7 +837,21 @@ def serialize(h, base_model, code):
     quant_buf = io.BytesIO()
     torch.save({'w': quant_result, 'm': quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = _compress(quant_raw, h.compressor)
+    # [02] optionally compare compressors
+    if h.compress_compare and h.is_main_process:
+        log(f'Compress-compare on raw size {len(quant_raw)}:')
+        for _comp in ('brotli', 'zstd', 'zstd_dict'):
+            try:
+                _t0 = time.perf_counter()
+                _b = _compress(quant_raw, _comp, byte_shuffle=h.byte_shuffle, zstd_level=h.zstd_level, zstd_dict_size=h.zstd_dict_size)
+                log(f'  {_comp}: {len(_b)} bytes ({time.perf_counter() - _t0:.1f}s)')
+            except Exception as _e:
+                log(f'  {_comp}: ERROR {_e}')
+    quant_blob = _compress(quant_raw, h.compressor, byte_shuffle=h.byte_shuffle, zstd_level=h.zstd_level, zstd_dict_size=h.zstd_dict_size)
+    if h.compress_roundtrip_test and h.is_main_process:
+        _rt = _decompress(quant_blob, h.compressor, byte_shuffle=h.byte_shuffle)
+        assert _rt == quant_raw, f'roundtrip failed: compressor={h.compressor} byte_shuffle={h.byte_shuffle}'
+        log(f'compress_roundtrip_test:OK compressor={h.compressor} byte_shuffle={int(h.byte_shuffle)}')
     quant_file_bytes = len(quant_blob)
     bytes_total = quant_file_bytes + code_bytes
     if h.is_main_process:
@@ -1243,8 +1248,9 @@ def main():
         raise RuntimeError('CUDA is required')
     if world_size <= 0:
         raise ValueError(f'WORLD_SIZE must be positive, got {world_size}')
-    if 8 % world_size != 0:
-        raise ValueError(f'WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral')
+    # [exp] relaxed: see 01_per_group_sdclip for rationale
+    if world_size > 8 or 786432 % (world_size * (8 // max(world_size, 1))) != 0:
+        raise ValueError(f'WORLD_SIZE={world_size} not supported: train_batch_tokens must divide cleanly')
     device = torch.device('cuda', local_rank)
     torch.cuda.set_device(device)
     if distributed:
