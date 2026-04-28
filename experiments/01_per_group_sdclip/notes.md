@@ -30,5 +30,5 @@ Robby Sneiderman's PR #1412 found that per-group Hessian-trace ratios are highly
 ```bash
 source experiments/01_per_group_sdclip/config.env
 RUN_ID=01_pgsdclip_seed42 SEED=42 \
-  torchrun --standalone --nproc_per_node=3 experiments/01_per_group_sdclip/train_gpt.py
+  torchrun --standalone --nproc_per_node=3 experiments/01_per_group_sdclip/tw_eval.py
 ```

@@ -29,5 +29,5 @@ TTT adapts to "context just seen", but the SOTA's fixed cuts mean SGD updates wi
 ```bash
 source experiments/04_doc_boundary_ttt/config.env
 RUN_ID=04_docttt_seed42 SEED=42 \
-  torchrun --standalone --nproc_per_node=3 experiments/04_doc_boundary_ttt/train_gpt.py
+  torchrun --standalone --nproc_per_node=3 experiments/04_doc_boundary_ttt/tw_eval.py
 ```

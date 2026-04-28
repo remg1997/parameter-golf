@@ -54,5 +54,5 @@ Requires `zstandard` Python package at runtime. Add to Containerfile.
 ```bash
 source experiments/02_arithmetic_coder/config.env
 RUN_ID=02_zstd_seed42 SEED=42 \
-  torchrun --standalone --nproc_per_node=3 experiments/02_arithmetic_coder/train_gpt.py
+  torchrun --standalone --nproc_per_node=3 experiments/02_arithmetic_coder/tw_eval.py
 ```

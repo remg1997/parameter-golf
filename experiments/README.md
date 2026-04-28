@@ -3,10 +3,10 @@
 ```
 experiments/
 ├── _shared/
-│   ├── sota_train_gpt.py   # decompressed bigbag SOTA (1.0810 BPB), reference
+│   ├── sota_tw_eval.py   # decompressed bigbag SOTA (1.0810 BPB), reference
 │   └── wandb_patch.py      # minimal wandb integration helpers
 ├── NN_short_name/
-│   ├── train_gpt.py        # forked + modified copy of sota_train_gpt.py
+│   ├── tw_eval.py        # forked + modified copy of sota_tw_eval.py
 │   ├── config.env          # env-var overrides for the run
 │   └── notes.md            # what we're testing, why, expected gain
 └── runs.md                 # cross-experiment log of results + WandB links
@@ -15,7 +15,7 @@ experiments/
 # Run an experiment:
 cd experiments/NN_short_name
 source config.env  # exports env vars
-torchrun --standalone --nproc_per_node=3 train_gpt.py
+torchrun --standalone --nproc_per_node=3 tw_eval.py
 ```
 
 `grad_accum_steps = 8 // world_size`, so `--nproc_per_node=3` keeps the same
