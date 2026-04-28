@@ -1,35 +1,40 @@
 # Container image for parameter-golf training on H100s.
 # Matches the software stack used by bigbag's SOTA (val_bpb=1.0810):
-#   PyTorch 2.9.1 + CUDA 12.8 + flash_attn_3 cu128_torch291 wheel.
+#   Python 3.12 + PyTorch 2.9.1 + CUDA 12.8 + flash_attn_3 cu128_torch291 wheel.
+#
+# IMPORTANT: SOTA source uses PEP 701 f-string syntax (nested same-quote strings),
+# which requires Python >= 3.12. The pytorch/pytorch image ships Python 3.11, so
+# we base on the official NVIDIA CUDA image and use Ubuntu 24.04's Python 3.12.
 #
 # Build (rootless podman, from repo root):
 #   podman build -t parameter-golf:dev -f experiments/_shared/Containerfile .
 #
 # Run (passes through GPUs 0, 1, 7):
-#   podman run --rm -it \
-#     --device nvidia.com/gpu=0 \
-#     --device nvidia.com/gpu=1 \
-#     --device nvidia.com/gpu=7 \
-#     --security-opt=label=disable \
-#     --ipc=host --shm-size=16g \
-#     -v $HOME/parameter-golf:/workspace \
-#     -v $HOME/.cache:/root/.cache \
-#     -e WANDB_API_KEY=$WANDB_API_KEY \
-#     -e HF_HUB_ENABLE_HF_TRANSFER=1 \
-#     parameter-golf:dev bash
+#   podman run --rm -it --device nvidia.com/gpu=0 --device nvidia.com/gpu=1 --device nvidia.com/gpu=7 --security-opt=label=disable --ipc=host -v $HOME/parameter-golf:/workspace -v $HOME/.cache:/root/.cache -e WANDB_API_KEY=$WANDB_API_KEY -e HF_HUB_ENABLE_HF_TRANSFER=1 parameter-golf:dev bash
 
-FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-devel
+FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv python3-dev \
         git curl ca-certificates build-essential ninja-build tmux \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip && \
-    pip install \
+# Use a venv to avoid PEP 668 "externally-managed-environment" on Ubuntu 24.04
+RUN python3 -m venv /opt/venv
+
+RUN pip install --upgrade pip wheel
+
+# torch 2.9.1 + cu128 (Python 3.12 wheels available)
+RUN pip install torch==2.9.1+cu128 \
+        --index-url https://download.pytorch.org/whl/cu128
+
+# Core deps used by training, eval, dataset download, and experiments
+RUN pip install \
         numpy \
         sentencepiece \
         brotli \
@@ -37,10 +42,10 @@ RUN pip install --upgrade pip && \
         huggingface-hub \
         hf_transfer \
         datasets \
-        tqdm
+        tqdm \
+        zstandard
 
-# flash_attn_3 — Hopper build matched to torch 2.9.1 + CUDA 12.8.
-# Using --no-deps so it doesn't try to reinstall torch.
+# flash_attn_3 Hopper wheel for cu128 + torch 2.9.1
 RUN pip install flash_attn_3 --no-deps \
         --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/
 
