@@ -49,5 +49,10 @@ RUN pip install \
 RUN pip install flash_attn_3 --no-deps \
         --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/
 
+# Optional: Mamba SSM (used by experiment 05). causal-conv1d is its companion
+# CUDA kernel. --no-build-isolation lets the build see the already-installed torch.
+RUN pip install causal-conv1d --no-build-isolation && \
+    pip install mamba-ssm --no-build-isolation
+
 WORKDIR /workspace
 CMD ["bash"]
