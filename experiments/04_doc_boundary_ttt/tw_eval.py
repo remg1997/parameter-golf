@@ -969,7 +969,10 @@ def eval_val_ttt(h, device, val_data, base_model, batch_seqs=32):
                 break
         chunk_windows[ci].append(ws)
     log(f'ttt:start chunks={num_chunks} ttt_lr={h.ttt_lr} ttt_epochs={h.ttt_epochs}')
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    # [04] doc-boundary chunks have variable size -> variable last-batch shapes;
+    # bump cache limit and allow dynamic shapes to avoid recompile churn.
+    torch._dynamo.config.cache_size_limit = max(getattr(torch._dynamo.config, 'cache_size_limit', 8), 128)
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=True, fullgraph=True)
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
