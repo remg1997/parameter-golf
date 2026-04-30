@@ -85,6 +85,8 @@ class Hyperparameters:
     ppm_h = float(os.environ.get('PPM_H', '0.9'))
     ppm_l = float(os.environ.get('PPM_L', '0.05'))
     ppm_t = float(os.environ.get('PPM_T', '0.9'))
+    dump_ppm_inputs = bool(int(os.environ.get('DUMP_PPM_INPUTS', '0')))
+    dump_ppm_path = os.environ.get('DUMP_PPM_PATH', 'ppm_inputs.npz')
     distributed = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
     rank = int(os.environ.get('RANK', '0'))
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
@@ -1017,13 +1019,21 @@ def eval_val_sliding(h, device, val_data, base_model, batch_seqs=32):
             if h.rank == 0:
                 tga_full = torch.cat([gather_t[r][:sizes_list[r]] for r in range(h.world_size)]).cpu().numpy()
                 lpa_full = torch.cat([gather_l[r][:sizes_list[r]] for r in range(h.world_size)]).cpu().numpy()
+                if h.dump_ppm_inputs:
+                    np.savez_compressed(h.dump_ppm_path, tga=tga_full.astype(np.int32), lpa=lpa_full.astype(np.float32))
+                    log(f'dumped ppm inputs to {h.dump_ppm_path}: tga={tga_full.shape} lpa={lpa_full.shape}')
                 t0 = time.perf_counter()
                 mixer_bpb = _ppm_mixture_bpb(tga_full, lpa_full, val_data.sp, O=h.ppm_order, H=h.ppm_h, L_=h.ppm_l, T=h.ppm_t)
                 log(f'ppm_mixer val_bpb:{mixer_bpb:.8f} eval_time:{1000.0 * (time.perf_counter() - t0):.0f}ms order={h.ppm_order} H={h.ppm_h} L={h.ppm_l} T={h.ppm_t} N_bytes={lpa_full.size}')
         else:
+            tga_np = tga_local_cat.numpy()
+            lpa_np = lpa_local_cat.numpy()
+            if h.dump_ppm_inputs:
+                np.savez_compressed(h.dump_ppm_path, tga=tga_np.astype(np.int32), lpa=lpa_np.astype(np.float32))
+                log(f'dumped ppm inputs to {h.dump_ppm_path}: tga={tga_np.shape} lpa={lpa_np.shape}')
             t0 = time.perf_counter()
-            mixer_bpb = _ppm_mixture_bpb(tga_local_cat.numpy(), lpa_local_cat.numpy(), val_data.sp, O=h.ppm_order, H=h.ppm_h, L_=h.ppm_l, T=h.ppm_t)
-            log(f'ppm_mixer val_bpb:{mixer_bpb:.8f} eval_time:{1000.0 * (time.perf_counter() - t0):.0f}ms order={h.ppm_order} H={h.ppm_h} L={h.ppm_l} T={h.ppm_t} N_bytes={lpa_local_cat.numel()}')
+            mixer_bpb = _ppm_mixture_bpb(tga_np, lpa_np, val_data.sp, O=h.ppm_order, H=h.ppm_h, L_=h.ppm_l, T=h.ppm_t)
+            log(f'ppm_mixer val_bpb:{mixer_bpb:.8f} eval_time:{1000.0 * (time.perf_counter() - t0):.0f}ms order={h.ppm_order} H={h.ppm_h} L={h.ppm_l} T={h.ppm_t} N_bytes={lpa_np.size}')
     base_model.train()
     return val_loss, val_bpb
 
